@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="screenshots/sumo_main.png" alt="SUMO – Sun Monitor" width="900">
+</p>
+
 # SUMO – Sun Monitor
 
 **SUMO (Sun Monitor)** is a desktop application dedicated to **space weather monitoring** and **solar activity awareness**.
