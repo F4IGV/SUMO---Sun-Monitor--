@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Capture d'écran 2026-02-15 173240.png" alt="SUMO – Sun Monitor" width="900">
+  <img src="main_SUMO.png" alt="SUMO – Sun Monitor" width="900">
 </p>
 
 # SUMO – Sun Monitor
