@@ -1,6 +1,6 @@
 ## Screenshot
 
-![SUMO v5.0 Dashboard](screenshots/sumo_v5_0.png)
+![SUMO v5.0 Dashboard](screenshots/SUMO_v5_0.png)
 
 # SUMO v5.0 – Space Weather & DX Operations Monitor
 
