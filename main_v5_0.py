@@ -40,7 +40,7 @@ UI: PySide6 + pyqtgraph
 - Fallback: si la colonne Bt n'existe pas, Bt est calculé par sqrt(bx^2 + by^2 + bz^2) si possible.
 """
 
-APP_VERSION = "v4.1"
+APP_VERSION = "v5.0"
 
 import sys
 import math
@@ -48,6 +48,8 @@ import time
 import sqlite3
 import xml.etree.ElementTree as ET
 import json
+import socket
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
@@ -483,6 +485,640 @@ class RssWorker(QtCore.QObject):
                 time.sleep(1)
 
 
+
+# =====================================================
+# DX CLUSTER (Telnet) - Worker + Panel
+# =====================================================
+
+def _dx_band_color(freq_val: float) -> str:
+    """Return a background color for a frequency.
+
+    DX clusters usually emit the frequency in **kHz** (e.g. 14074.0, 144200.0),
+    while our UI logic wants **MHz**. This helper accepts either:
+      - MHz (e.g. 14.074, 144.200)
+      - kHz (e.g. 14074.0, 144200.0)  -> auto-converted to MHz
+    """
+    try:
+        f = float(freq_val)
+    except Exception:
+        return "#121a22"
+
+    # Auto-detect kHz vs MHz
+    # Anything above ~1000 is almost certainly kHz (since 1000 MHz = 1 GHz).
+    if f >= 1000.0:
+        f = f / 1000.0  # kHz -> MHz
+
+    # HF amateur bands (MHz) — each band gets its own distinct color
+    # (freq ranges are intentionally broad to match typical DX spot frequencies)
+    if 1.8   <= f <= 2.0:     return "#2dd4bf"  # 160m (teal)
+    if 3.5   <= f <= 4.0:     return "#22c55e"  # 80m  (green)
+    if 5.3   <= f <= 5.5:     return "#60a5fa"  # 60m  (blue)
+    if 7.0   <= f <= 7.3:     return "#f59e0b"  # 40m  (amber)
+    if 10.1  <= f <= 10.15:   return "#a78bfa"  # 30m  (violet)
+    if 14.0  <= f <= 14.35:   return "#f472b6"  # 20m  (pink)
+    if 18.068<= f <= 18.168:  return "#34d399"  # 17m  (mint)
+    if 21.0  <= f <= 21.45:   return "#fb7185"  # 15m  (rose)
+    if 24.89 <= f <= 24.99:   return "#93c5fd"  # 12m  (light blue)
+    if 28.0  <= f <= 29.7:    return "#f97316"  # 10m  (orange)
+    if 50.0  <= f <= 54.0:    return "#ef4444"  # 6m   (red)
+    if 70.0  <= f <= 70.5:    return "#e879f9"  # 4m   (magenta, region dependent)
+
+    # VHF/UHF/SHF (MHz)
+    # Note: allocations vary by ITU region; these ranges are broad enough for most spots.
+    # EU/ITU1 common: 2m = 144–146, 70cm = 430–440 (we keep wider to be safe).
+    if 144.0 <= f <= 148.0: return "#38bdf8"  # 2m (cyan)
+    if 219.0 <= f <= 225.0: return "#60a5fa"  # 1.25m (US) (blue)
+    if 420.0 <= f <= 450.0: return "#facc15"  # 70cm (yellow)
+    if 902.0 <= f <= 928.0: return "#2dd4bf"  # 33cm (US) (teal)
+    if 1240.0 <= f <= 1300.0: return "#c084fc"  # 23cm (purple)
+
+    # Fallback: bucket by frequency range so it's never "all violet"
+    if f < 30.0:   return "#8bd3dd"  # generic HF
+    if f < 300.0:  return "#caffbf"  # generic VHF
+    if f < 1000.0: return "#ffd6a5"  # generic UHF
+    return "#b36bff"  # generic SHF
+
+
+class DxClusterWorker(QtCore.QObject):
+    """Simple DXCluster (DXSpider-like) telnet reader (Python 3.13 safe).
+
+    Notes:
+    - Many DXSpider nodes use TELNET negotiation (IAC ...). We strip it.
+    - Most nodes require a callsign login after a prompt ("login:", "call:", "callsign").
+      Sending the callsign too early can cause immediate disconnect.
+    Emits parsed spots as dicts: {"freq": float, "call": str, "raw": str, "ts": float}.
+    """
+    spot = QtCore.Signal(dict)
+    status = QtCore.Signal(str)
+    error = QtCore.Signal(str)
+
+    def __init__(self, host: str, port: int, login: str = ""):
+        super().__init__()
+        self.host = host
+        self.port = int(port)
+        self.login = (login or "").strip()
+        self._stop = False
+
+        # Incremental TELNET filter state.
+        # This avoids the classic bug where keeping a raw tail (for split IAC sequences)
+        # causes already-decoded text to be decoded again, producing duplicated spots.
+        self._tn_state = {
+            "iac": False,          # last byte was IAC
+            "cmd": None,           # DO/DONT/WILL/WONT waiting for opt
+            "sb": False,           # inside subnegotiation
+            "sb_iac": False,       # saw IAC inside SB, waiting for SE or IAC
+        }
+
+    def _telnet_filter(self, chunk: bytes) -> bytes:
+        """Filter a TELNET stream incrementally and return printable payload bytes."""
+        IAC = 255
+        DO, DONT, WILL, WONT = 253, 254, 251, 252
+        SB, SE = 250, 240
+
+        st = self._tn_state
+        out = bytearray()
+
+        for b in chunk:
+            # Waiting for option after DO/DONT/WILL/WONT
+            if st["cmd"] is not None:
+                # consume option byte, ignore
+                st["cmd"] = None
+                continue
+
+            # Inside subnegotiation
+            if st["sb"]:
+                if st["sb_iac"]:
+                    # We previously saw IAC inside SB
+                    if b == SE:
+                        st["sb"] = False
+                        st["sb_iac"] = False
+                        continue
+                    if b == IAC:
+                        # escaped IAC inside SB
+                        st["sb_iac"] = False
+                        continue
+                    # some other command; stay in SB
+                    st["sb_iac"] = False
+                    continue
+
+                if b == IAC:
+                    st["sb_iac"] = True
+                # ignore SB payload
+                continue
+
+            # Not in SB
+            if st["iac"]:
+                st["iac"] = False
+
+                if b == IAC:
+                    # Escaped 255 -> literal 255
+                    out.append(IAC)
+                    continue
+                if b in (DO, DONT, WILL, WONT):
+                    st["cmd"] = b
+                    continue
+                if b == SB:
+                    st["sb"] = True
+                    st["sb_iac"] = False
+                    continue
+                # Other TELNET commands are ignored
+                continue
+
+            if b == IAC:
+                st["iac"] = True
+                continue
+
+            # Normal printable byte
+            out.append(b)
+
+        return bytes(out)
+
+    def stop(self):
+        self._stop = True
+
+    def _emit_status(self, s: str):
+        try:
+            self.status.emit(str(s))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _strip_telnet_iac(buf: bytes) -> bytes:
+        """Remove TELNET IAC negotiation sequences from a byte buffer."""
+        IAC = 255
+        DO, DONT, WILL, WONT = 253, 254, 251, 252
+        SB, SE = 250, 240
+
+        out = bytearray()
+        i = 0
+        n = len(buf)
+        while i < n:
+            b = buf[i]
+            if b != IAC:
+                out.append(b)
+                i += 1
+                continue
+
+            # IAC encountered
+            if i + 1 >= n:
+                # incomplete IAC at end; drop it
+                break
+            cmd = buf[i + 1]
+
+            # Escaped 255 (IAC IAC) => literal 255
+            if cmd == IAC:
+                out.append(IAC)
+                i += 2
+                continue
+
+            # WILL/WONT/DO/DONT <opt>
+            if cmd in (DO, DONT, WILL, WONT):
+                if i + 2 < n:
+                    i += 3
+                else:
+                    break
+                continue
+
+            # Subnegotiation: IAC SB ... IAC SE
+            if cmd == SB:
+                i += 2
+                # consume until IAC SE
+                while i < n:
+                    if buf[i] == IAC and (i + 1) < n and buf[i + 1] == SE:
+                        i += 2
+                        break
+                    i += 1
+                continue
+
+            # Other 2-byte commands: skip IAC <cmd>
+            i += 2
+
+        return bytes(out)
+
+    def run(self):
+        # Best-effort reconnect loop
+        while not self._stop:
+            sock = None
+            try:
+                self._emit_status(f"connecting to {self.host}:{self.port}…")
+                sock = socket.create_connection((self.host, int(self.port)), timeout=10)
+                sock.settimeout(1.0)
+
+                connected_at = time.time()
+                logged = False
+                last_rx = time.time()
+
+                text_buf = ""  # decoded, telnet-filtered (incremental)
+
+                self._emit_status(f"connected to {self.host}:{self.port} (waiting login prompt)")
+
+                while not self._stop:
+                    try:
+                        chunk = sock.recv(4096)
+                    except (socket.timeout, TimeoutError):
+                        # normal idle: keep connection
+                        chunk = b""
+
+                    if chunk:
+                        last_rx = time.time()
+                        # TELNET negotiation can arrive split across recv() calls.
+                        # Use the incremental filter to avoid re-decoding old bytes
+                        # (which was causing each spot line to appear twice).
+                        clean = self._telnet_filter(chunk)
+                        try:
+                            text_buf += clean.decode("utf-8", errors="ignore")
+                        except Exception:
+                            pass
+
+                    # If server closed connection
+                    if chunk == b"":
+                        # no data: only treat as closed if recv returned 0 bytes *without* timeout
+                        # In our code, timeout sets chunk=b"" too, so we can't tell here.
+                        # Instead, use a longer "no RX" window after having been connected.
+                        pass
+
+                    # 1) Login handling: wait for a prompt
+                    if self.login and not logged and text_buf:
+                        low = text_buf.lower()
+                        # Common prompts; be permissive
+                        if ("login" in low) or ("call:" in low) or ("callsign" in low) or ("enter your call" in low):
+                            try:
+                                sock.sendall((self.login + "\r\n").encode("utf-8", errors="ignore"))
+                                logged = True
+                                self._emit_status(f"DX: logged as {self.login}")
+                                # reset buffers to avoid parsing banner as spots
+                                text_buf = ""
+                                continue
+                            except Exception as e:
+                                raise ConnectionError(f"failed to send login: {e}")
+
+                        # Fallback: if a prompt isn't explicit, some nodes show '>' after banner
+                        if (time.time() - connected_at) > 2.0 and (">" in low or "dxspider" in low):
+                            try:
+                                sock.sendall((self.login + "\r\n").encode("utf-8", errors="ignore"))
+                                logged = True
+                                self._emit_status(f"DX: logged as {self.login}")
+                                text_buf = ""
+                                continue
+                            except Exception as e:
+                                raise ConnectionError(f"failed to send login: {e}")
+
+                    # 2) If we haven't received anything for a while, treat as disconnect
+                    # (some nodes accept TCP then immediately close on bad login)
+                    if (time.time() - last_rx) > 20.0 and not logged:
+                        raise ConnectionError("no banner/prompt received (node closed or filtered)")
+
+                    # 3) Parse complete lines for spots
+                    if "\n" in text_buf:
+                        lines = text_buf.splitlines()
+                        # keep the last partial line (if any)
+                        if not text_buf.endswith("\n"):
+                            text_buf = lines.pop() if lines else ""
+                        else:
+                            text_buf = ""
+
+                        for line in lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+
+                            # DXSpider classic: "DX de CALL-#: 14074.0  STATION  ..."
+                            if line.startswith("DX de"):
+                                m1 = re.search(r":\s*([0-9]+\.[0-9]+)\s+(\S+)", line)
+                                if m1:
+                                    try:
+                                        freq = float(m1.group(1))
+                                    except Exception:
+                                        freq = float("nan")
+                                    call = (m1.group(2) or "").strip()
+                                    self.spot.emit({"freq": freq, "call": call, "raw": line, "ts": time.time()})
+                                continue
+
+                            # Some nodes print: "<freq> <call> ..." (rare) — keep best effort
+                            m2 = re.match(r"^\s*([0-9]+\.[0-9]+)\s+(\S+)\s+(.+)$", line)
+                            if m2:
+                                try:
+                                    freq = float(m2.group(1))
+                                except Exception:
+                                    freq = float("nan")
+                                call = (m2.group(2) or "").strip()
+                                self.spot.emit({"freq": freq, "call": call, "raw": line, "ts": time.time()})
+                                continue
+
+                    # 4) Gentle loop pacing
+                    QtCore.QThread.msleep(20)
+
+                # stop requested
+            except Exception as e:
+                try:
+                    self.error.emit(str(e))
+                except Exception:
+                    pass
+                self._emit_status(f"DX: offline ({e})")
+                # Backoff (max ~10s) without blocking stop
+                for _ in range(10):
+                    if self._stop:
+                        break
+                    time.sleep(1)
+            finally:
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+
+
+
+# =====================================================
+# POTA SPOTS (HTTP JSON) - Worker
+# =====================================================
+
+POTA_SPOTS_URL = "https://api.pota.app/spot/activator"  # public JSON list of current activators
+
+def _pota_parse_time_iso(ts: str) -> float:
+    """Parse POTA spotTime ISO string to epoch seconds (best-effort)."""
+    s = (ts or "").strip()
+    if not s:
+        return time.time()
+    try:
+        # Example: 2023-12-29T16:31:57  (no timezone)
+        # We assume UTC if tz info is missing.
+        if s.endswith("Z"):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return time.time()
+
+
+class PotaSpotsWorker(QtCore.QObject):
+    """Poll POTA spots (current activators) and emit them as 'spot' dicts.
+
+    Emits spot dicts compatible with DxClusterPanel.add_spot():
+      {"freq": float, "call": str, "raw": str, "ts": float}
+
+    Source: https://api.pota.app/spot/activator (JSON array). citeturn3search3turn3search9
+    """
+    spot = QtCore.Signal(dict)
+    status = QtCore.Signal(str)
+    error = QtCore.Signal(str)
+
+    def __init__(self, url: str = POTA_SPOTS_URL, refresh_seconds: int = 30):
+        super().__init__()
+        self.url = url
+        self.refresh_seconds = int(refresh_seconds)
+        self._stop = False
+        self._seen_ids: set[str] = set()
+
+    def stop(self):
+        self._stop = True
+
+    def _emit_status(self, s: str):
+        try:
+            self.status.emit(str(s))
+        except Exception:
+            pass
+
+    def run(self):
+        while not self._stop:
+            try:
+                self._emit_status("POTA: loading…")
+                r = requests.get(self.url, timeout=15, headers={"User-Agent": "SUMO-SunMonitor/0.1"})
+                r.raise_for_status()
+                data = r.json()
+
+                if not isinstance(data, list):
+                    raise ValueError("unexpected POTA response (not a list)")
+
+                # Sort newest first by spotTime
+                def _key(x):
+                    try:
+                        return _pota_parse_time_iso(str(x.get("spotTime") or ""))
+                    except Exception:
+                        return 0.0
+
+                data_sorted = sorted(data, key=_key, reverse=False)  # oldest first; panel inserts new spots at top
+
+                emitted = 0
+                now = time.time()
+
+                for it in data_sorted:
+                    if self._stop:
+                        break
+                    try:
+                        freq_s = str(it.get("frequency") or "").strip()
+                        call = str(it.get("activator") or it.get("callsign") or it.get("call") or "").strip()
+                        ref = str(it.get("reference") or it.get("park") or "").strip()
+                        mode = str(it.get("mode") or "").strip()
+                        spot_time = str(it.get("spotTime") or "").strip()
+
+                        try:
+                            freq = float(freq_s) if freq_s else float("nan")
+                        except Exception:
+                            freq = float("nan")
+
+                        ts = _pota_parse_time_iso(spot_time) if spot_time else now
+
+                        # Build a stable-ish id to avoid duplicates across refresh cycles
+                        sid = f"{call}|{ref}|{mode}|{freq_s}|{int(ts)}"
+                        if sid in self._seen_ids:
+                            continue
+                        self._seen_ids.add(sid)
+
+                        raw = f"POTA {ref} {mode} {freq_s} {call}".strip()
+                        loc = str(it.get("locationDesc") or it.get("location") or "").strip()
+                        self.spot.emit({"freq": freq, "call": call, "raw": raw, "ts": ts, "reference": ref, "locationDesc": loc})
+                        emitted += 1
+
+                        # Keep the seen set bounded
+                        if len(self._seen_ids) > 4000:
+                            # drop random-ish old entries by recreating from tail
+                            self._seen_ids = set(list(self._seen_ids)[-2000:])
+
+                        if emitted >= 60:
+                            break
+                    except Exception:
+                        continue
+
+                self._emit_status(f"POTA: ok ({len(data)} active)")
+
+            except Exception as e:
+                try:
+                    self.error.emit(str(e))
+                except Exception:
+                    pass
+                self._emit_status(f"POTA: offline ({e})")
+
+            # Sleep (interruptible)
+            for _ in range(max(5, self.refresh_seconds)):
+                if self._stop:
+                    break
+                time.sleep(1)
+
+
+class DxClusterPanel(QtWidgets.QFrame):
+    """A compact left-side DX Cluster panel (list of latest spots)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("dxPanel")
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
+
+        self._spots: list[dict] = []
+        self._max_spots = 40
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        head = QtWidgets.QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+
+        self.lbl_title = QtWidgets.QLabel("Cluster")
+        self.lbl_title.setStyleSheet("color:#44d16e; font-size: 28px; font-weight: 900;")
+        head.addWidget(self.lbl_title, 0)
+
+        head.addStretch(1)
+
+        self.lbl_count = QtWidgets.QLabel("▲0")
+        self.lbl_count.setStyleSheet("color:#44d16e; font-size: 18px; font-weight: 900;")
+        head.addWidget(self.lbl_count, 0)
+
+        root.addLayout(head)
+
+        self.lbl_sub = QtWidgets.QLabel("offline")
+        self.lbl_sub.setStyleSheet("color:#44d16e; font-size: 16px; font-family: Consolas; font-weight: 800;")
+        root.addWidget(self.lbl_sub, 0)
+
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Freq", "Call", "Age"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.table.setAlternatingRowColors(False)
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background: #0f1720;
+                color: #d7dde6;
+                border: 1px solid #2a3440;
+                border-radius: 10px;
+                font-family: Consolas;
+                font-size: 14px;
+            }
+            QHeaderView::section {
+                background: #0e141a;
+                color: #aab6c5;
+                font-weight: 900;
+                border: 0px;
+                padding: 6px 6px;
+            }
+        """)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.setColumnWidth(2, 52)
+
+        root.addWidget(self.table, 1)
+
+        # Age updater
+        self._age_timer = QtCore.QTimer(self)
+        self._age_timer.timeout.connect(self._refresh_age)
+        self._age_timer.start(1000)
+
+        self.setStyleSheet("""
+            QFrame#dxPanel {
+                background: #0f1720;
+                border: 2px solid #2a3440;
+                border-radius: 14px;
+            }
+        """)
+
+    def set_connection_label(self, host: str, port: int):
+        self.lbl_sub.setText(f"{host}:{int(port)}")
+
+    def set_status(self, s: str):
+        # keep one-line status
+        self.lbl_sub.setText(s)
+
+    def set_title(self, t: str):
+        try:
+            self.lbl_title.setText(str(t))
+        except Exception:
+            pass
+
+    def clear_spots(self):
+        self._spots.clear()
+        self.table.setRowCount(0)
+        self.lbl_count.setText("▲0")
+
+    def add_spot(self, spot: dict):
+        self._spots.insert(0, spot)
+        if len(self._spots) > self._max_spots:
+            self._spots = self._spots[: self._max_spots]
+
+        self._rebuild_table()
+
+    def _rebuild_table(self):
+        self.table.setRowCount(len(self._spots))
+        now = time.time()
+
+        for r, s in enumerate(self._spots):
+            freq = s.get("freq", float("nan"))
+            call = (s.get("call") or "").strip()
+            ts = float(s.get("ts") or now)
+
+            # Freq cell with colored background
+            freq_txt = "--.--"
+            try:
+                if isinstance(freq, float) and not math.isnan(freq):
+                    freq_txt = f"{freq:0.1f}"
+            except Exception:
+                pass
+
+            it0 = QtWidgets.QTableWidgetItem(freq_txt)
+            it0.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            it0.setForeground(QtGui.QBrush(QtGui.QColor("#0b0f12")))
+            it0.setBackground(QtGui.QBrush(QtGui.QColor(_dx_band_color(freq))))
+            it0.setFont(QtGui.QFont("Consolas", 14, QtGui.QFont.Bold))
+
+            it1 = QtWidgets.QTableWidgetItem(call)
+            it1.setTextAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            it1.setForeground(QtGui.QBrush(QtGui.QColor("#d7dde6")))
+            it1.setFont(QtGui.QFont("Consolas", 14, QtGui.QFont.Bold))
+
+            age = max(0.0, now - ts)
+            age_txt = f"{int(age/60)}m" if age >= 60 else f"{int(age)}s"
+            it2 = QtWidgets.QTableWidgetItem(age_txt)
+            it2.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            it2.setForeground(QtGui.QBrush(QtGui.QColor("#d7dde6")))
+            it2.setFont(QtGui.QFont("Consolas", 12, QtGui.QFont.Bold))
+
+            self.table.setItem(r, 0, it0)
+            self.table.setItem(r, 1, it1)
+            self.table.setItem(r, 2, it2)
+
+        self.lbl_count.setText(f"▲{len(self._spots)}")
+
+    def _refresh_age(self):
+        # Update the "Age" column only (cheap)
+        try:
+            now = time.time()
+            for r, s in enumerate(self._spots):
+                ts = float(s.get("ts") or now)
+                age = max(0.0, now - ts)
+                age_txt = f"{int(age/60)}m" if age >= 60 else f"{int(age)}s"
+                it = self.table.item(r, 2)
+                if it:
+                    it.setText(age_txt)
+        except Exception:
+            pass
 class RssTicker(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -927,41 +1563,92 @@ def db_load_aurora_since(db_path: Path, since_epoch: float) -> tuple[np.ndarray,
 # SETTINGS DIALOG
 # =====================================================
 class SettingsDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None, rss_url: str = "", nasa_api_key: str = "", time_mode: str = "utc", rss_speed: int = RSS_SCROLL_PX_PER_TICK):
+    def __init__(
+        self,
+        parent=None,
+        rss_url: str = "",
+        nasa_api_key: str = "",
+        time_mode: str = "utc",
+        rss_speed: int = RSS_SCROLL_PX_PER_TICK,
+        dx_enabled: bool = False,
+        dx_source: str = "dx",
+        dx_host: str = "dxspider.co.uk",
+        dx_port: int = 7300,
+        dx_login: str = "",
+        pota_zone: str = "worldwide",
+    ):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self.resize(700, 260)
+        self.resize(760, 420)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
 
-        form = QtWidgets.QFormLayout()
-        form.setHorizontalSpacing(10)
-        form.setVerticalSpacing(8)
+        # --- Tabs ---
+        tabs = QtWidgets.QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.setMovable(False)
+        tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border-left: 1px solid #2a3440;
+                border-right: 1px solid #2a3440;
+                border-bottom: 1px solid #2a3440;
+                border-top: 0px;
+                border-radius: 10px;
+                background: #0e141a;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: #121a22;
+                color: #d7dde6;
+                border: 1px solid #2a3440;
+                padding: 8px 14px;
+                margin-right: 6px;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                font-weight: 800;
+            }
+            QTabBar::tab:selected {
+                background: #0f1720;
+                border-bottom: 1px solid #0f1720;
+            }
+        """)
+
+        # ========== TAB 1: RSS ==========
+        tab_rss = QtWidgets.QWidget()
+        rss_l = QtWidgets.QVBoxLayout(tab_rss)
+        rss_l.setContentsMargins(14, 14, 14, 14)
+        rss_l.setSpacing(10)
+
+        form_rss = QtWidgets.QFormLayout()
+        form_rss.setHorizontalSpacing(10)
+        form_rss.setVerticalSpacing(8)
 
         self.ed_rss = QtWidgets.QLineEdit(rss_url or "")
-        self.ed_rss.setPlaceholderText("Ex: https://www.nasa.gov/news-release/feed/  (RSS)  ou  https://services.swpc.noaa.gov/text/wwv.txt  (NOAA WWV)")
+        self.ed_rss.setPlaceholderText(
+            "Ex: https://www.nasa.gov/news-release/feed/  (RSS)  ou  https://services.swpc.noaa.gov/text/wwv.txt  (NOAA WWV)"
+        )
         self.ed_rss.setClearButtonEnabled(True)
-        form.addRow("RSS feed URL:", self.ed_rss)
+        form_rss.addRow("RSS feed URL:", self.ed_rss)
 
-        # Raccourcis RSS: NASA / NOAA
+        # RSS shortcuts
         btn_row = QtWidgets.QHBoxLayout()
-        
         self.btn_use_nasa = QtWidgets.QPushButton("Use NASA RSS")
         self.btn_use_nasa.setToolTip("Remplit l'URL avec le feed RSS NASA (Solar System News)")
         self.btn_use_nasa.clicked.connect(lambda: self.ed_rss.setText(RSS_SOLAR_SYSTEM_URL))
         btn_row.addWidget(self.btn_use_nasa)
-        
+
         self.btn_use_wwv = QtWidgets.QPushButton("Use NOAA Alert")
         self.btn_use_wwv.setToolTip("Remplit l'URL avec le bulletin NOAA WWV (texte brut)")
         self.btn_use_wwv.clicked.connect(lambda: self.ed_rss.setText(NOAA_WWV_URL))
         btn_row.addWidget(self.btn_use_wwv)
-        
+
         btn_row.addStretch(1)
-        form.addRow("", btn_row)
-        # --- RSS scroll speed presets (3 buttons) ---
+        form_rss.addRow("", btn_row)
+
+        # RSS scroll speed presets
         SPEED_NORMAL = 2
         SPEED_FAST = 3
         SPEED_TURBO = 5
@@ -982,55 +1669,27 @@ class SettingsDialog(QtWidgets.QDialog):
             b.setCheckable(True)
             b.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
             b.setFixedHeight(28)
+            b.setStyleSheet("""
+                QPushButton {
+                    background: #121a22;
+                    color: #d7dde6;
+                    border: 1px solid #2a3440;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-weight: 800;
+                }
+                QPushButton:hover { background: #16202a; }
+            """)
 
-        # style: base + checked variants (green / orange / purple)
-        self.btn_speed_normal.setStyleSheet("""
-            QPushButton {
-                background: #121a22;
-                color: #d7dde6;
-                border: 1px solid #2a3440;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-weight: 800;
-            }
-            QPushButton:hover { background: #16202a; }
-            QPushButton:checked {
-                background: #44d16e;
-                color: #0b0f12;
-                border: 0px;
-            }
+        # checked variants (SUMO vibe)
+        self.btn_speed_normal.setStyleSheet(self.btn_speed_normal.styleSheet() + """
+            QPushButton:checked { background: #44d16e; color:#0b0f12; border:0px; }
         """)
-        self.btn_speed_fast.setStyleSheet("""
-            QPushButton {
-                background: #121a22;
-                color: #d7dde6;
-                border: 1px solid #2a3440;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-weight: 800;
-            }
-            QPushButton:hover { background: #16202a; }
-            QPushButton:checked {
-                background: #ff9f43;
-                color: #0b0f12;
-                border: 0px;
-            }
+        self.btn_speed_fast.setStyleSheet(self.btn_speed_fast.styleSheet() + """
+            QPushButton:checked { background: #ff9f43; color:#0b0f12; border:0px; }
         """)
-        self.btn_speed_turbo.setStyleSheet("""
-            QPushButton {
-                background: #121a22;
-                color: #d7dde6;
-                border: 1px solid #2a3440;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-weight: 800;
-            }
-            QPushButton:hover { background: #16202a; }
-            QPushButton:checked {
-                background: #9b59b6;
-                color: #0b0f12;
-                border: 0px;
-            }
+        self.btn_speed_turbo.setStyleSheet(self.btn_speed_turbo.styleSheet() + """
+            QPushButton:checked { background: #9b59b6; color:#0b0f12; border:0px; }
         """)
 
         def set_speed(v: int):
@@ -1047,28 +1706,30 @@ class SettingsDialog(QtWidgets.QDialog):
         speed_row.addWidget(self.btn_speed_fast)
         speed_row.addWidget(self.btn_speed_turbo)
         speed_row.addStretch(1)
+        form_rss.addRow("Scroll speed:", speed_row)
 
-        form.addRow("Scroll speed:", speed_row)
-
-        # init selection
         set_speed(self._rss_speed_value)
+
+        rss_l.addLayout(form_rss)
+        rss_l.addStretch(1)
+
+        # ========== TAB 2: API Keys ==========
+        tab_api = QtWidgets.QWidget()
+        api_l = QtWidgets.QVBoxLayout(tab_api)
+        api_l.setContentsMargins(14, 14, 14, 14)
+        api_l.setSpacing(10)
+
+        form_api = QtWidgets.QFormLayout()
+        form_api.setHorizontalSpacing(10)
+        form_api.setVerticalSpacing(8)
 
         self.ed_nasa = QtWidgets.QLineEdit(nasa_api_key or "")
         self.ed_nasa.setPlaceholderText("NASA API key (optionnel, recommandé)")
         self.ed_nasa.setClearButtonEnabled(True)
         self.ed_nasa.setEchoMode(QtWidgets.QLineEdit.Password)
-        form.addRow("NASA API key:", self.ed_nasa)
+        form_api.addRow("NASA API key:", self.ed_nasa)
 
-        self.cb_time_mode = QtWidgets.QComboBox()
-        self.cb_time_mode.addItem("UTC", "utc")
-        self.cb_time_mode.addItem("Local", "local")
-        # set current
-        tm = (time_mode or "utc").strip().lower()
-        idx = 0 if tm != "local" else 1
-        self.cb_time_mode.setCurrentIndex(idx)
-        form.addRow("Clock:", self.cb_time_mode)
-
-        root.addLayout(form)
+        api_l.addLayout(form_api)
 
         link_row = QtWidgets.QHBoxLayout()
         link_row.setContentsMargins(0, 0, 0, 0)
@@ -1089,47 +1750,158 @@ class SettingsDialog(QtWidgets.QDialog):
             }
             QPushButton:hover { background: #16202a; }
         """)
-
-        self.btn_donate = QtWidgets.QPushButton("Support SUMO ❤️")
-        self.btn_donate.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.btn_donate.setFixedHeight(28)
-        self.btn_donate.setToolTip("Support SUMO development via PayPal ❤️")
-        self.btn_donate.clicked.connect(self._open_paypal_donate)
-        self.btn_donate.setStyleSheet("""
-            QPushButton {
-                background: #0e141a;
-                color: #d7dde6;
-                border: 1px solid #2a3440;
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-weight: 800;
-            }
-            QPushButton:hover { background: #16202a; }
-        """)
-
-        link_row.addWidget(self.btn_get_key)
-        link_row.addWidget(self.btn_donate)
         link_row.addStretch(1)
-        root.addLayout(link_row)
+        api_l.addLayout(link_row)
 
-        hint = QtWidgets.QLabel(
-            "• L’URL RSS/Atom met à jour le bandeau immédiatement.\n"
-            "• La clé NASA réduit fortement les erreurs 429 (rate limit) sur DONKI.\n"
-            "• Le bouton 'Get NASA API key' ouvre la page officielle de demande de clé.\n"
-            "• Horloge: choisissez UTC ou heure locale.\n"
-            "• Donate: ouvre la page PayPal."
+        hint_api = QtWidgets.QLabel("• La clé NASA réduit fortement les erreurs 429 (rate limit) sur DONKI.")
+        hint_api.setStyleSheet("color: #aab6c5; font-size: 11px;")
+        hint_api.setWordWrap(True)
+        api_l.addWidget(hint_api)
+        api_l.addStretch(1)
+
+        # ========== TAB 3: Clock ==========
+        tab_time = QtWidgets.QWidget()
+        time_l = QtWidgets.QVBoxLayout(tab_time)
+        time_l.setContentsMargins(14, 14, 14, 14)
+        time_l.setSpacing(10)
+
+        form_time = QtWidgets.QFormLayout()
+        form_time.setHorizontalSpacing(10)
+        form_time.setVerticalSpacing(8)
+
+        self.cb_time_mode = QtWidgets.QComboBox()
+        self.cb_time_mode.addItem("UTC", "utc")
+        self.cb_time_mode.addItem("Local", "local")
+        tm = (time_mode or "utc").strip().lower()
+        self.cb_time_mode.setCurrentIndex(0 if tm != "local" else 1)
+
+        form_time.addRow("Clock:", self.cb_time_mode)
+        time_l.addLayout(form_time)
+
+        hint_time = QtWidgets.QLabel("• Change l’affichage de l’horloge (UTC / heure locale).")
+        hint_time.setStyleSheet("color: #aab6c5; font-size: 11px;")
+        hint_time.setWordWrap(True)
+        time_l.addWidget(hint_time)
+        time_l.addStretch(1)
+
+        # ========== TAB 4: DX Cluster ==========
+        tab_dx = QtWidgets.QWidget()
+        dx_l = QtWidgets.QVBoxLayout(tab_dx)
+        dx_l.setContentsMargins(14, 14, 14, 14)
+        dx_l.setSpacing(10)
+
+        form_dx = QtWidgets.QFormLayout()
+        form_dx.setHorizontalSpacing(10)
+        form_dx.setVerticalSpacing(8)
+
+        self.cb_dx_enabled = QtWidgets.QCheckBox("Enable DX Cluster panel")
+        self.cb_dx_enabled.setChecked(bool(dx_enabled))
+        self.cb_dx_enabled.setToolTip(
+            "Adds a left-side DX Cluster column (telnet). Can also be toggled from main UI button."
         )
-        hint.setStyleSheet("color: #aab6c5; font-size: 11px;")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
+        form_dx.addRow("DX Cluster:", self.cb_dx_enabled)
 
+        self.cb_dx_source = QtWidgets.QComboBox()
+        self.cb_dx_source.addItem("DX Spider (telnet)", "dx")
+        self.cb_dx_source.addItem("POTA spots (api.pota.app)", "pota")
+        ds = (dx_source or "dx").strip().lower()
+        if ds not in ("dx", "pota"):
+            ds = "dx"
+        self.cb_dx_source.setCurrentIndex(0 if ds == "dx" else 1)
+        self.cb_dx_source.setToolTip("Choose the content of the left DX column.")
+        form_dx.addRow("DX column source:", self.cb_dx_source)
+
+        dx_row = QtWidgets.QHBoxLayout()
+        dx_row.setContentsMargins(0, 0, 0, 0)
+        dx_row.setSpacing(8)
+
+        self.ed_dx_host = QtWidgets.QLineEdit(dx_host or "dxspider.co.uk")
+        self.ed_dx_host.setPlaceholderText("Host (ex: dxspider.co.uk)")
+        self.ed_dx_host.setClearButtonEnabled(True)
+        dx_row.addWidget(self.ed_dx_host, 1)
+
+        self.ed_dx_port = QtWidgets.QSpinBox()
+        self.ed_dx_port.setRange(1, 65535)
+        self.ed_dx_port.setValue(int(dx_port) if dx_port else 7300)
+        self.ed_dx_port.setFixedWidth(110)
+        dx_row.addWidget(self.ed_dx_port, 0)
+
+        form_dx.addRow("DX host:port:", dx_row)
+
+        self.ed_dx_login = QtWidgets.QLineEdit((dx_login or "").strip())
+        self.ed_dx_login.setPlaceholderText("Your callsign (ex: F4IGV)")
+        self.ed_dx_login.setClearButtonEnabled(True)
+        self.ed_dx_login.setToolTip(
+            "DXSpider requires a login callsign right after connect. SUMO will send this callsign automatically."
+        )
+        form_dx.addRow("DX login:", self.ed_dx_login)
+
+
+        # POTA zone filter
+        self.cb_pota_zone = QtWidgets.QComboBox()
+        self.cb_pota_zone.addItem("Worldwide", "worldwide")
+        self.cb_pota_zone.addItem("USA", "usa")
+        self.cb_pota_zone.addItem("Europe", "europe")
+        pz = (pota_zone or "worldwide").strip().lower()
+        if pz not in ("worldwide", "usa", "europe"):
+            pz = "worldwide"
+        # set current
+        for i in range(self.cb_pota_zone.count()):
+            if str(self.cb_pota_zone.itemData(i)) == pz:
+                self.cb_pota_zone.setCurrentIndex(i)
+                break
+        self.cb_pota_zone.setToolTip("Filter POTA spots by region (applies only when DX source is POTA).")
+        form_dx.addRow("POTA zone:", self.cb_pota_zone)
+
+        def _sync_pota_zone_enabled():
+            try:
+                srcv = str(self.cb_dx_source.currentData() or "dx").strip().lower()
+                self.cb_pota_zone.setEnabled(srcv == "pota")
+            except Exception:
+                self.cb_pota_zone.setEnabled(False)
+
+        self.cb_dx_source.currentIndexChanged.connect(_sync_pota_zone_enabled)
+        _sync_pota_zone_enabled()
+
+        dx_l.addLayout(form_dx)
+
+        hint_dx = QtWidgets.QLabel("• Le contenu de la colonne DX peut être DXSpider (telnet) ou POTA (HTTP).")
+        hint_dx.setStyleSheet("color: #aab6c5; font-size: 11px;")
+        hint_dx.setWordWrap(True)
+        dx_l.addWidget(hint_dx)
+        dx_l.addStretch(1)
+
+        # Add tabs
+        tabs.addTab(tab_rss, "RSS")
+        tabs.addTab(tab_api, "API Keys")
+        tabs.addTab(tab_time, "Clock")
+        tabs.addTab(tab_dx, "DX Cluster")
+
+        root.addWidget(tabs, 1)
+
+        # --- Save/Cancel ---
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel
         )
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        root.addWidget(btns)
+        root.addWidget(btns, 0)
 
+        # --- Bottom status bar ---
+        self.sb = QtWidgets.QStatusBar()
+        self.sb.setSizeGripEnabled(False)
+        self.sb.setFixedHeight(22)
+        self.sb.setStyleSheet("""
+            QStatusBar {
+                background: #0f1720;
+                border-top: 1px solid #2a3440;
+                padding-left: 8px;
+                padding-right: 8px;
+            }
+        """)
+        root.addWidget(self.sb, 0)
+
+    # ===== getters (same API as before) =====
     def rss_url(self) -> str:
         return self.ed_rss.text().strip()
 
@@ -1143,20 +1915,40 @@ class SettingsDialog(QtWidgets.QDialog):
     def rss_speed(self) -> int:
         return int(getattr(self, "_rss_speed_value", RSS_SCROLL_PX_PER_TICK))
 
+    def dx_enabled(self) -> bool:
+        return bool(self.cb_dx_enabled.isChecked())
+
+    def dx_source(self) -> str:
+        try:
+            data = self.cb_dx_source.currentData()
+            return (str(data) if data else "dx").strip().lower()
+        except Exception:
+            return "dx"
+
+    def dx_host(self) -> str:
+        return self.ed_dx_host.text().strip() or "dxspider.co.uk"
+
+    def dx_port(self) -> int:
+        try:
+            return int(self.ed_dx_port.value())
+        except Exception:
+            return 7300
+
+    def dx_login(self) -> str:
+        return self.ed_dx_login.text().strip()
+
+    def pota_zone(self) -> str:
+        try:
+            data = self.cb_pota_zone.currentData() if hasattr(self, "cb_pota_zone") else "worldwide"
+            v = (str(data) if data else "worldwide").strip().lower()
+            return v if v in ("worldwide", "usa", "europe") else "worldwide"
+        except Exception:
+            return "worldwide"
+
     @QtCore.Slot()
     def _open_nasa_key_page(self):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(NASA_API_KEY_REQUEST_URL))
 
-
-
-    @QtCore.Slot()
-    def _open_paypal_donate(self):
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl(PAYPAL_DONATE_URL))
-
-
-# =====================================================
-# ABOUT DIALOG (GPLv3)
-# =====================================================
 class AboutDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2102,6 +2894,276 @@ class SumoEasterInvaders(QtWidgets.QDialog):
         p.end()
 
 
+
+# =====================================================
+# HF BAND OPENINGS RIBBON (0–30 MHz)
+# =====================================================
+
+HF_BANDS = [
+    ("160m", 1.8),
+    ("80m",  3.5),
+    ("40m",  7.0),
+    ("30m", 10.1),
+    ("20m", 14.0),
+    ("17m", 18.1),
+    ("15m", 21.0),
+    ("12m", 24.9),
+    ("10m", 28.0),
+]
+
+def _hf_muf_estimate_mhz(sfi: float, kp: float) -> float:
+    """Heuristic MUF estimate (MHz) from SFI, degraded by Kp."""
+    if sfi is None or (isinstance(sfi, float) and math.isnan(sfi)):
+        return float("nan")
+    if kp is None or (isinstance(kp, float) and math.isnan(kp)):
+        kp = 0.0
+
+    muf = 0.14 * float(sfi) + 3.0
+    kp_excess = max(0.0, float(kp) - 3.0)
+    muf *= max(0.60, 1.0 - 0.055 * kp_excess)  # floor at 60%
+
+    return float(max(1.0, muf))
+
+def _hf_absorption_factor(xray_class: str) -> float:
+    """Simple D-layer absorption factor from flare class."""
+    c = (xray_class or "").strip().upper()
+    if not c or c == "?":
+        return 1.0
+    if c.startswith("X"):
+        return 0.45
+    if c.startswith("M"):
+        return 0.70
+    if c.startswith("C"):
+        return 0.90
+    return 1.0
+
+def _hf_band_state(freq_mhz: float, muf_mhz: float, absorption: float) -> tuple[str, str, int]:
+    """Return (label, color, score 0..100) for a band."""
+    if muf_mhz is None or (isinstance(muf_mhz, float) and math.isnan(muf_mhz)):
+        return ("N/A", ACCENT_GREY, 0)
+
+    # Low bands more affected by absorption
+    if freq_mhz <= 7.0:
+        abs_eff = absorption
+    elif freq_mhz <= 14.0:
+        abs_eff = min(1.0, 0.85 + 0.15 * absorption)
+    else:
+        abs_eff = min(1.0, 0.92 + 0.08 * absorption)
+
+    eff_muf = muf_mhz * abs_eff
+    ratio = eff_muf / float(freq_mhz)
+
+    if ratio >= 1.20:
+        return ("OPEN", ACCENT_GREEN, 90)
+    if ratio >= 1.05:
+        return ("FAIR", "#ffd34d", 70)
+    if ratio >= 0.90:
+        return ("POOR", "#ff9f43", 45)
+    return ("CLOSED", "#ff4d4d", 15)
+
+def _muf_color(muf_mhz: float) -> tuple[str, str]:
+    """Return (bg_color, text) for MUF."""
+    if muf_mhz is None or (isinstance(muf_mhz, float) and math.isnan(muf_mhz)):
+        return (ACCENT_GREY, "--.- MHz")
+    m = float(muf_mhz)
+    if m < 7:
+        return ("#ff4d4d", f"{m:.1f} MHz")
+    if m < 10:
+        return ("#ff9f43", f"{m:.1f} MHz")
+    if m < 14:
+        return ("#ffd34d", f"{m:.1f} MHz")
+    if m < 18:
+        return (ACCENT_GREEN, f"{m:.1f} MHz")
+    if m < 24:
+        return ("#4aa3ff", f"{m:.1f} MHz")
+    return ("#b36bff", f"{m:.1f} MHz")
+
+def _parse_xray_magnitude(xray_class: str) -> tuple[str, float]:
+    """Parse 'M5.2' -> ('M', 5.2). Unknown -> ('', nan)."""
+    c = (xray_class or "").strip().upper()
+    if not c or c == "?":
+        return ("", float("nan"))
+    letter = c[0]
+    try:
+        val = float(c[1:])
+    except Exception:
+        return (letter, float("nan"))
+    return (letter, val)
+
+def _radio_blackout_level(xray_class: str) -> tuple[str, str]:
+    """Return (R-level label, color) from GOES flare class (heuristic NOAA R-scale mapping)."""
+    letter, mag = _parse_xray_magnitude(xray_class)
+    # Defaults
+    if not letter:
+        return ("R0", ACCENT_GREEN)
+
+    if letter in ("A", "B", "C"):
+        return ("R0", ACCENT_GREEN)
+
+    if letter == "M":
+        if isinstance(mag, float) and not math.isnan(mag):
+            if mag < 5.0:
+                return ("R1", "#ffd34d")  # minor
+            return ("R2", "#ff9f43")     # moderate
+        return ("R1", "#ffd34d")
+
+    if letter == "X":
+        if isinstance(mag, float) and not math.isnan(mag):
+            if mag < 5.0:
+                return ("R3", "#ff4d4d")  # strong
+            if mag < 10.0:
+                return ("R4", "#ff4dd2")  # severe (magenta)
+            return ("R5", "#b36bff")      # extreme (violet)
+        return ("R3", "#ff4d4d")
+
+    return ("R0", ACCENT_GREEN)
+
+
+class HfBandBar(QtWidgets.QFrame):
+    """Compact HF (0–30 MHz) openings ribbon shown under the header."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("hfBandBar")
+        self.setFixedHeight(48)
+
+        self._muf_hist: list[tuple[float, float]] = []
+
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(12, 6, 12, 6)
+        lay.setSpacing(8)
+
+        self.lbl_title = QtWidgets.QLabel("HF openings (0–30 MHz):")
+        self.lbl_title.setStyleSheet("color: #aab6c5; font-size: 12px; font-weight: 900;")
+        lay.addWidget(self.lbl_title, 0)
+
+        # Band chips
+        self._chips: dict[str, QtWidgets.QLabel] = {}
+        for name, _f in HF_BANDS:
+            chip = QtWidgets.QLabel(name)
+            chip.setAlignment(QtCore.Qt.AlignCenter)
+            chip.setFixedHeight(26)
+            chip.setMinimumWidth(52)
+            chip.setStyleSheet(self._chip_style("#121a22"))
+            self._chips[name] = chip
+            lay.addWidget(chip, 0)
+
+        lay.addStretch(1)
+
+        # MUF badge
+        self.lbl_muf = QtWidgets.QLabel("MUF: --.- MHz")
+        self.lbl_muf.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_muf.setFixedHeight(26)
+        self.lbl_muf.setMinimumWidth(190)
+        self.lbl_muf.setStyleSheet(self._badge_style(ACCENT_GREY))
+        lay.addWidget(self.lbl_muf, 0)
+
+        # Radio blackout badge
+        self.lbl_blackout = QtWidgets.QLabel("RADIO BLACKOUT R0")
+        self.lbl_blackout.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_blackout.setFixedHeight(26)
+        self.lbl_blackout.setMinimumWidth(170)
+        self.lbl_blackout.setStyleSheet(self._badge_style(ACCENT_GREEN))
+        lay.addWidget(self.lbl_blackout, 0)
+
+        self.setStyleSheet(f"""
+            QFrame#hfBandBar {{
+                background: {BG_PANEL};
+                border: 1px solid {BORDER};
+                border-radius: 10px;
+            }}
+        """)
+
+        self.update_from_indices(float("nan"), float("nan"), "", float("nan"))
+
+    @staticmethod
+    def _badge_style(bg: str) -> str:
+        return f"""
+            QLabel {{
+                background: {bg};
+                color: #0b0f12;
+                border-radius: 8px;
+                padding: 2px 10px;
+                font-weight: 900;
+                font-size: 12px;
+            }}
+        """
+
+    @staticmethod
+    def _chip_style(bg: str) -> str:
+        # If bg is dark, keep border. If bg is accent, no border.
+        is_dark = (bg.lower() == "#121a22") or (bg.lower() == "#0f1720")
+        if is_dark:
+            return """
+                QLabel {
+                    background: #121a22;
+                    color: #d7dde6;
+                    border: 1px solid #2a3440;
+                    border-radius: 8px;
+                    padding: 2px 8px;
+                    font-weight: 900;
+                    font-size: 12px;
+                }
+            """
+        return f"""
+            QLabel {{
+                background: {bg};
+                color: #0b0f12;
+                border: 0px;
+                border-radius: 8px;
+                padding: 2px 8px;
+                font-weight: 900;
+                font-size: 12px;
+            }}
+        """
+
+    def update_from_indices(self, sfi_now: float, kp_now: float, xray_class: str, sw_speed: float):
+        muf = _hf_muf_estimate_mhz(sfi_now, kp_now)
+        absorption = _hf_absorption_factor(xray_class)
+
+        # --- MUF trend over last 10 minutes ---
+        now = time.time()
+        self._muf_hist.append((now, muf))
+        self._muf_hist = [(t, v) for t, v in self._muf_hist if now - t <= 600]
+
+        muf_delta = 0.0
+        trend = "→"
+        if len(self._muf_hist) >= 2:
+            v0 = self._muf_hist[0][1]
+            v1 = self._muf_hist[-1][1]
+            if not (isinstance(v0, float) and math.isnan(v0)) and not (isinstance(v1, float) and math.isnan(v1)):
+                muf_delta = v1 - v0
+                if muf_delta > 0.3:
+                    trend = "▲"
+                elif muf_delta < -0.3:
+                    trend = "▼"
+
+        muf_color, muf_text = _muf_color(muf)
+        delta_txt = f"{trend} {muf_delta:+.1f} MHz"
+        self.lbl_muf.setText(f"MUF: {muf_text}  {delta_txt}")
+        self.lbl_muf.setStyleSheet(self._badge_style(muf_color))
+
+        r_label, r_color = _radio_blackout_level(xray_class)
+        self.lbl_blackout.setText(f"RADIO BLACKOUT {r_label}")
+        self.lbl_blackout.setStyleSheet(self._badge_style(r_color))
+
+        # Band chips
+        for band, freq in HF_BANDS:
+            state, color, score = _hf_band_state(freq, muf, absorption)
+            chip = self._chips.get(band)
+            if chip:
+                chip.setText(band)
+                chip.setStyleSheet(self._chip_style(color))
+                chip.setToolTip(
+                    f"{band} ({freq:.1f} MHz)\n"
+                    f"Status: {state} — score {score}/100\n"
+                    f"MUF est.: {muf_text}\n"
+                    f"Kp: {kp_now if not (isinstance(kp_now,float) and math.isnan(kp_now)) else '?'}\n"
+                    f"SFI: {sfi_now if not (isinstance(sfi_now,float) and math.isnan(sfi_now)) else '?'}\n"
+                    f"X-ray: {xray_class or '?'}\n"
+                    "Note: heuristic indicator (not path/location specific)."
+                )
+
 # =====================================================
 # MAIN WINDOW
 # =====================================================
@@ -2150,7 +3212,17 @@ class MainWindow(QtWidgets.QMainWindow):
             "proton_s4": str(self._sounds_dir / "proton_s4.wav"),
         }
         self._sfx = {}
-        self._init_sound_effects()
+        # Initialize QSoundEffect objects if possible (avoid relying on a method that may be missing if code is edited)
+        try:
+            for key, path in self._sound_paths.items():
+                s = QSoundEffect(self)
+                s.setLoopCount(1)
+                s.setVolume(0.9)
+                s.setSource(QtCore.QUrl.fromLocalFile(path))
+                self._sfx[key] = s
+        except Exception:
+            # If QtMultimedia backend is missing, we'll fall back to QApplication.beep() where needed.
+            self._sfx = {}
         self._rss_url = str(self._cfg.get("rss_url") or DEFAULT_RSS_URL).strip() or DEFAULT_RSS_URL
         self._nasa_api_key = str(self._cfg.get("nasa_api_key") or "").strip()
         self._rss_speed = int(self._cfg.get("rss_speed", RSS_SCROLL_PX_PER_TICK))
@@ -2159,6 +3231,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._time_mode = str(self._cfg.get("time_mode") or "utc").strip().lower()
         if self._time_mode not in ("utc", "local"):
             self._time_mode = "utc"
+
+
+        # --- DX Column (Cluster / POTA) settings ---
+        self._dx_enabled = bool(self._cfg.get("dx_enabled", False))
+        self._dx_source = str(self._cfg.get("dx_source") or "dx").strip().lower()
+        if self._dx_source not in ("dx", "pota"):
+            self._dx_source = "dx"
+        self._dx_host = str(self._cfg.get("dx_host") or "dxspider.co.uk").strip() or "dxspider.co.uk"
+        self._dx_login = str(self._cfg.get("dx_login") or "").strip()
+        self._pota_zone = str(self._cfg.get("pota_zone") or "worldwide").strip().lower()
+        if self._pota_zone not in ("worldwide", "usa", "europe"):
+            self._pota_zone = "worldwide"
+        try:
+            self._dx_port = int(self._cfg.get("dx_port", 7300))
+        except Exception:
+            self._dx_port = 7300
+
+        # --- HF openings ribbon visibility ---
+        self._hf_bar_visible = bool(self._cfg.get("hf_bar_visible", True))
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2176,7 +3267,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.logo = QtWidgets.QLabel()
         self.logo.setFixedSize(78, 78)
         self.logo.setScaledContents(True)
-        self._load_logo(str(ASSETS_DIR / "logo.png"))
+        if hasattr(self, "_load_logo"):
+            self._load_logo(str(ASSETS_DIR / "logo.png"))
+        else:
+            pm = QtGui.QPixmap(str(ASSETS_DIR / "logo.png"))
+            if pm.isNull():
+                pm = QtGui.QPixmap(58, 58)
+                pm.fill(QtGui.QColor("#333"))
+            self.logo.setPixmap(pm)
 
         # --- Easter egg: triple-click on logo to launch mini-game ---
         self.logo.installEventFilter(self)
@@ -2225,18 +3323,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_status.setObjectName("statusText")
         self._set_data_status("connecting")
 
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.setContentsMargins(0, 0, 0, 0)
-        btn_row.setSpacing(8)
+        # Put the data status in the bottom status bar (saves space in the top-right)
+        try:
+            self.statusBar().addPermanentWidget(self.lbl_status, 1)
+        except Exception:
+            pass
+
+
+        btn_grid = QtWidgets.QGridLayout()
+        btn_grid.setContentsMargins(0, 0, 0, 0)
+        btn_grid.setHorizontalSpacing(8)
+        btn_grid.setVerticalSpacing(6)
 
         self.btn_fullscreen = QtWidgets.QPushButton("Full screen")
         self.btn_fullscreen.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.btn_fullscreen.setFixedHeight(28)
+        self.btn_fullscreen.setFixedHeight(24)
         self.btn_fullscreen.clicked.connect(self._toggle_fullscreen)
 
         self.btn_settings = QtWidgets.QPushButton("Settings")
         self.btn_settings.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.btn_settings.setFixedHeight(28)
+        self.btn_settings.setFixedHeight(24)
         self.btn_settings.clicked.connect(self._open_settings)
         self.btn_settings.setStyleSheet(f"""
             QPushButton {{
@@ -2250,15 +3356,27 @@ class MainWindow(QtWidgets.QMainWindow):
             QPushButton:hover {{ opacity: 0.95; }}
         """)
 
+        self.btn_dx = QtWidgets.QPushButton("")
+        self.btn_dx.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.btn_dx.setFixedHeight(24)
+        self.btn_dx.clicked.connect(self._toggle_dx_panel)
+        self._update_dx_button()
+
+        self.btn_hfbar = QtWidgets.QPushButton("")
+        self.btn_hfbar.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.btn_hfbar.setFixedHeight(24)
+        self.btn_hfbar.clicked.connect(self._toggle_hf_bar)
+        self._update_hfbar_button()
+
         self.btn_about = QtWidgets.QPushButton("About")
 
         self.btn_sound = QtWidgets.QPushButton("")
         self.btn_sound.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.btn_sound.setFixedHeight(28)
+        self.btn_sound.setFixedHeight(24)
         self.btn_sound.clicked.connect(self._toggle_sound)
         self._update_sound_button()
         self.btn_about.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.btn_about.setFixedHeight(28)
+        self.btn_about.setFixedHeight(24)
         self.btn_about.clicked.connect(self._open_about)
         self.btn_about.setStyleSheet("""
             QPushButton {
@@ -2273,13 +3391,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
 
 
-        btn_row.addWidget(self.btn_fullscreen)
-        btn_row.addWidget(self.btn_settings)
-        btn_row.addWidget(self.btn_sound)
-        btn_row.addWidget(self.btn_about)
+        btn_grid.addWidget(self.btn_fullscreen, 0, 0)
+        btn_grid.addWidget(self.btn_settings,   1, 0)
+        btn_grid.addWidget(self.btn_dx,         2, 0)
+        btn_grid.addWidget(self.btn_hfbar,      2, 1)
+        btn_grid.addWidget(self.btn_sound,      0, 1)
+        btn_grid.addWidget(self.btn_about,      1, 1)
 
-        right.addWidget(self.lbl_status, 0, QtCore.Qt.AlignRight)
-        right.addLayout(btn_row)
+        right.addLayout(btn_grid)
+        right.addStretch(1)
 
         self._update_fullscreen_button()
 
@@ -2290,10 +3410,15 @@ class MainWindow(QtWidgets.QMainWindow):
         top_l.addLayout(right, 0)
         root.addWidget(top)
 
-        grid = QtWidgets.QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(10)
-        root.addLayout(grid, 1)
+        # --- HF openings ribbon (0–30 MHz) ---
+        self.hf_bar = HfBandBar()
+        root.addWidget(self.hf_bar)
+        self.hf_bar.setVisible(bool(getattr(self, "_hf_bar_visible", True)))
+
+        self.main_grid = QtWidgets.QGridLayout()
+        self.main_grid.setContentsMargins(0, 0, 0, 0)
+        self.main_grid.setSpacing(10)
+        root.addLayout(self.main_grid, 1)
 
         self.panels: dict[str, KpLikePanel] = {}
 
@@ -2318,13 +3443,17 @@ class MainWindow(QtWidgets.QMainWindow):
             p = KpLikePanel(cfg)
             p.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
             self.panels[key] = p
-            grid.addWidget(p, r, c)
+            # Widgets are laid out later (to support optional DX column)
+            pass
 
-        # Ensure the 3x3 grid keeps consistent sizes (avoid oversized first row)
-        for rr in range(3):
-            grid.setRowStretch(rr, 1)
-        for cc in range(3):
-            grid.setColumnStretch(cc, 1)
+        # Build the grid layout (9 panels, optional DX column)
+        self.dx_panel = DxClusterPanel()
+        self.dx_panel.setMinimumWidth(320)
+        self.dx_panel.setMaximumWidth(380)
+        self._layout_main_grid()
+
+        if self._dx_enabled:
+            self._start_dx_worker()
 
         # Aurora: keep a rolling timeline of the last 25 hours (no extra network calls)
         # One sample per refresh (default: 60s) -> ~1500 points over 25h.
@@ -2391,7 +3520,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rss_thread.start()
 
     def _open_settings(self):
-        dlg = SettingsDialog(self, rss_url=self._rss_url, nasa_api_key=self._nasa_api_key, time_mode=self._time_mode, rss_speed=self._rss_speed)
+        dlg = SettingsDialog(self, rss_url=self._rss_url, nasa_api_key=self._nasa_api_key, time_mode=self._time_mode, rss_speed=self._rss_speed,
+                          dx_enabled=self._dx_enabled, dx_source=self._dx_source, dx_host=self._dx_host, dx_port=self._dx_port, dx_login=self._dx_login, pota_zone=getattr(self, "_pota_zone", "worldwide"))
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
 
@@ -2399,21 +3529,52 @@ class MainWindow(QtWidgets.QMainWindow):
         new_key = dlg.nasa_api_key().strip()
         new_mode = dlg.time_mode().strip().lower() or "utc"
         new_speed = dlg.rss_speed()
+        new_dx_enabled = dlg.dx_enabled()
+        new_dx_source = dlg.dx_source().strip().lower() or "dx"
+        if new_dx_source not in ("dx", "pota"):
+            new_dx_source = "dx"
+        new_dx_host = dlg.dx_host().strip() or "dxspider.co.uk"
+        new_dx_port = dlg.dx_port()
+        new_dx_login = dlg.dx_login().strip()
+        new_pota_zone = dlg.pota_zone().strip().lower() or "worldwide"
+        if new_pota_zone not in ("worldwide", "usa", "europe"):
+            new_pota_zone = "worldwide"
 
         changed_rss = (new_rss != self._rss_url)
         changed_key = (new_key != self._nasa_api_key)
         changed_mode = (new_mode != self._time_mode)
         changed_speed = (int(new_speed) != int(self._rss_speed))
+        changed_dx = (bool(new_dx_enabled) != bool(self._dx_enabled)) or (str(new_dx_source) != str(self._dx_source)) or (new_dx_host != self._dx_host) or (int(new_dx_port) != int(self._dx_port)) or (new_dx_login != self._dx_login) or (str(new_pota_zone) != str(getattr(self, "_pota_zone", "worldwide")) )
 
         self._rss_url = new_rss
         self._nasa_api_key = new_key
         self._time_mode = new_mode
         self._rss_speed = max(1, min(10, int(new_speed)))
 
+        self._dx_enabled = bool(new_dx_enabled)
+        self._dx_source = str(new_dx_source).strip().lower() if str(new_dx_source).strip() else "dx"
+        if self._dx_source not in ("dx", "pota"):
+            self._dx_source = "dx"
+        self._dx_host = str(new_dx_host).strip() or "dxspider.co.uk"
+        try:
+            self._dx_port = int(new_dx_port)
+        except Exception:
+            self._dx_port = 7300
+        self._dx_login = str(new_dx_login).strip()
+        self._pota_zone = str(new_pota_zone).strip().lower() or "worldwide"
+        if self._pota_zone not in ("worldwide", "usa", "europe"):
+            self._pota_zone = "worldwide"
+
         self._cfg["rss_url"] = self._rss_url
         self._cfg["nasa_api_key"] = self._nasa_api_key
         self._cfg["time_mode"] = self._time_mode
         self._cfg["rss_speed"] = int(self._rss_speed)
+        self._cfg["dx_enabled"] = bool(self._dx_enabled)
+        self._cfg["dx_source"] = str(self._dx_source)
+        self._cfg["dx_host"] = self._dx_host
+        self._cfg["dx_port"] = int(self._dx_port)
+        self._cfg["dx_login"] = self._dx_login
+        self._cfg["pota_zone"] = str(getattr(self, "_pota_zone", "worldwide"))
         save_config(CONFIG_PATH, self._cfg)
 
         if changed_rss:
@@ -2429,6 +3590,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if changed_speed:
             self.rss_ticker.setSpeed(self._rss_speed)
 
+        if changed_dx:
+            self._update_dx_button()
+            self._layout_main_grid()
+            if self._dx_enabled:
+                self.dx_panel.clear_spots()
+                self._start_dx_worker()
+            else:
+                self._stop_dx_worker()
+
 
     def _open_about(self):
         dlg = AboutDialog(self)
@@ -2437,6 +3607,325 @@ class MainWindow(QtWidgets.QMainWindow):
     def _is_fullscreen(self) -> bool:
         return bool(self.windowState() & QtCore.Qt.WindowFullScreen)
 
+    
+    def _update_dx_button(self):
+        if getattr(self, "_dx_enabled", False):
+            self.btn_dx.setText("DX ON")
+            self.btn_dx.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background: {BTN_GREEN};
+                    color: {BTN_TEXT};
+                    border: 0px;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-weight: 900;
+                }}
+                """
+            )
+        else:
+            self.btn_dx.setText("DX OFF")
+            self.btn_dx.setStyleSheet(
+                """
+                QPushButton {
+                    background: #121a22;
+                    color: #d7dde6;
+                    border: 1px solid #2a3440;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-weight: 900;
+                }
+                QPushButton:hover { background: #16202a; }
+                """
+            )
+
+
+    def _update_hfbar_button(self):
+        """Update the HF ribbon toggle button in the top bar."""
+        if getattr(self, "_hf_bar_visible", True):
+            self.btn_hfbar.setText("HF BAR ON")
+            self.btn_hfbar.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background: {BTN_GREEN};
+                    color: {BTN_TEXT};
+                    border: 0px;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-weight: 900;
+                }}
+                """
+            )
+        else:
+            self.btn_hfbar.setText("HF BAR OFF")
+            self.btn_hfbar.setStyleSheet(
+                """
+                QPushButton {
+                    background: #121a22;
+                    color: #d7dde6;
+                    border: 1px solid #2a3440;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-weight: 900;
+                }
+                QPushButton:hover { background: #16202a; }
+                """
+            )
+
+    @QtCore.Slot()
+    def _toggle_hf_bar(self):
+        """Show/hide the HF openings ribbon under the top bar."""
+        self._hf_bar_visible = not getattr(self, "_hf_bar_visible", True)
+        self._cfg["hf_bar_visible"] = bool(self._hf_bar_visible)
+        save_config(CONFIG_PATH, self._cfg)
+
+        try:
+            if hasattr(self, "hf_bar") and self.hf_bar is not None:
+                self.hf_bar.setVisible(bool(self._hf_bar_visible))
+        except Exception:
+            pass
+
+        self._update_hfbar_button()
+
+    def _clear_layout(self, layout: QtWidgets.QLayout):
+        while layout.count():
+            it = layout.takeAt(0)
+            w = it.widget()
+            l = it.layout()
+            if w is not None:
+                w.setParent(None)
+            if l is not None:
+                self._clear_layout(l)
+
+    def _layout_main_grid(self):
+        """Lay out the 9 solar panels, optionally with a left DX column."""
+        g = self.main_grid
+        self._clear_layout(g)
+
+        if getattr(self, "_dx_enabled", False):
+            # DX column spans all 3 rows on the left (col 0)
+            g.addWidget(self.dx_panel, 0, 0, 3, 1)
+
+            # Shift solar panels to cols 1..3
+            positions = [(0, 1), (0, 2), (0, 3),
+                         (1, 1), (1, 2), (1, 3),
+                         (2, 1), (2, 2), (2, 3)]
+
+            # Column sizing: fixed DX + 3 equal columns
+            g.setColumnMinimumWidth(0, 320)
+            g.setColumnStretch(0, 0)
+            for cc in (1, 2, 3):
+                g.setColumnStretch(cc, 1)
+
+        else:
+            positions = [(0, 0), (0, 1), (0, 2),
+                         (1, 0), (1, 1), (1, 2),
+                         (2, 0), (2, 1), (2, 2)]
+
+            # Reset any previous DX-layout column sizing (important when toggling DX ON/OFF at runtime)
+            # - Column 0 should behave like a normal solar column again (no fixed min width)
+            g.setColumnMinimumWidth(0, 0)
+
+            # - Column 3 must not keep stretch from the DX layout, otherwise it stays as an empty column
+            g.setColumnMinimumWidth(3, 0)
+            g.setColumnStretch(3, 0)
+
+            for cc in (0, 1, 2):
+                g.setColumnStretch(cc, 1)
+
+
+        # Always 3 rows equal
+        for rr in range(3):
+            g.setRowStretch(rr, 1)
+
+        order = ["CME", "XRAY", "KP", "SSN", "SFI", "BZBT", "P10", "AUR", "SW"]
+        for key, (r, c) in zip(order, positions):
+            w = self.panels.get(key)
+            if w is not None:
+                g.addWidget(w, r, c)
+
+    def _start_dx_worker(self):
+        """Start the left DX column worker (DX Cluster telnet OR POTA spots)."""
+        self._stop_dx_worker()
+
+        # Decide source
+        src = str(getattr(self, "_dx_source", "dx") or "dx").strip().lower()
+        if src not in ("dx", "pota"):
+            src = "dx"
+        self._dx_source = src
+
+        self._dx_thread = QtCore.QThread(self)
+
+        if src == "pota":
+            # POTA spots (HTTP JSON)
+            self.dx_panel.set_title("POTA")
+            self.dx_panel.set_status("POTA: loading…")
+            self._dx_worker = PotaSpotsWorker(POTA_SPOTS_URL, refresh_seconds=30)
+            # Buffering to avoid UI freezes when many spots arrive at once
+            self._pota_spot_buffer = []
+            self._pota_flush_scheduled = False
+        else:
+            # DX Cluster (telnet)
+            self.dx_panel.set_title("Cluster")
+            self.dx_panel.set_connection_label(self._dx_host, self._dx_port)
+            self.dx_panel.set_status(f"{self._dx_host}:{self._dx_port}")
+            self._dx_worker = DxClusterWorker(self._dx_host, self._dx_port, login=self._dx_login)
+
+        self._dx_worker.moveToThread(self._dx_thread)
+        self._dx_thread.started.connect(self._dx_worker.run)
+        self._dx_worker.spot.connect(self._on_dx_spot)
+        self._dx_worker.status.connect(self.dx_panel.set_status)
+        self._dx_worker.error.connect(self._on_dx_error)
+        self._dx_thread.start()
+
+    def _stop_dx_worker(self):
+        try:
+            if hasattr(self, "_dx_worker") and self._dx_worker:
+                self._dx_worker.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_dx_thread") and self._dx_thread:
+                self._dx_thread.quit()
+                self._dx_thread.wait(1500)
+        except Exception:
+            pass
+        try:
+            self._pota_spot_buffer = []
+            self._pota_flush_scheduled = False
+        except Exception:
+            pass
+        self._dx_thread = None
+        self._dx_worker = None
+
+    @QtCore.Slot()
+    def _flush_pota_spots(self):
+        """Apply buffered POTA spots in one UI update to avoid freezes."""
+        try:
+            buf = getattr(self, "_pota_spot_buffer", None)
+            if not buf:
+                self._pota_flush_scheduled = False
+                return
+            self._pota_spot_buffer = []
+            self._pota_flush_scheduled = False
+
+            if not getattr(self, "_dx_enabled", False):
+                return
+
+            # Bulk insert then rebuild once (much cheaper than rebuilding for every spot)
+            try:
+                self.dx_panel.table.setUpdatesEnabled(False)
+            except Exception:
+                pass
+
+            for s in buf:
+                try:
+                    self.dx_panel._spots.insert(0, s)
+                except Exception:
+                    continue
+
+            # keep bounded
+            try:
+                if len(self.dx_panel._spots) > self.dx_panel._max_spots:
+                    self.dx_panel._spots = self.dx_panel._spots[: self.dx_panel._max_spots]
+            except Exception:
+                pass
+
+            self.dx_panel._rebuild_table()
+
+        except Exception:
+            pass
+        finally:
+            try:
+                self.dx_panel.table.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+    @QtCore.Slot(dict)
+    def _on_dx_spot(self, spot: dict):
+        try:
+            if not getattr(self, "_dx_enabled", False):
+                return
+
+            # If POTA source, buffer spots and flush in a single repaint
+            if str(getattr(self, "_dx_source", "dx") or "dx").strip().lower() == "pota":
+                if not hasattr(self, "_pota_spot_buffer") or self._pota_spot_buffer is None:
+                    self._pota_spot_buffer = []
+
+                # Apply POTA zone filter (Worldwide / USA / Europe)
+                try:
+                    z = str(getattr(self, "_pota_zone", "worldwide") or "worldwide").strip().lower()
+                    if z in ("usa", "europe"):
+                        # Get POTA fields (worker provides them; fallback to parsing 'raw')
+                        ref = str(spot.get("reference") or "").strip().upper()
+                        loc = str(spot.get("locationDesc") or "").strip().upper()
+                        if not ref:
+                            try:
+                                raw = str(spot.get("raw") or "")
+                                parts = raw.split()
+                                # expected: "POTA <REF> <MODE> <FREQ> <CALL>"
+                                if len(parts) >= 2 and parts[0].upper() == "POTA":
+                                    ref = parts[1].strip().upper()
+                            except Exception:
+                                pass
+                        prog = ref.split("-", 1)[0] if "-" in ref else ""
+                        if z == "usa":
+                            if not (loc.startswith("US-") or prog == "K"):
+                                return
+                        else:
+                            # Europe: prefer locationDesc ISO country code when available
+                            country = loc.split("-", 1)[0] if "-" in loc else ""
+                            EUROPE_ISO = {
+                                "AD","AL","AT","BA","BE","BG","BY","CH","CY","CZ","DE","DK","EE","ES","FI","FR","GB","GE","GR","HR","HU","IE","IS","IT","LI","LT","LU","LV","MC","MD","ME","MK","MT","NL","NO","PL","PT","RO","RS","RU","SE","SI","SK","SM","TR","UA","VA"
+                            }
+                            # Fallback to reference program prefix for common European programs
+                            EU_PROG = {"F","DL","EA","CT","I","OE","HB","ON","PA","LX","G","GM","GW","GI","EI","OK","OM","SP","LA","SM","OH","OZ","SV","LZ","YO","HA","9A","S5","YU","TF","IS"}
+                            if country:
+                                if country not in EUROPE_ISO:
+                                    return
+                            else:
+                                if prog not in EU_PROG:
+                                    return
+                except Exception:
+                    pass
+
+                self._pota_spot_buffer.append(spot)
+
+                if not getattr(self, "_pota_flush_scheduled", False):
+                    self._pota_flush_scheduled = True
+                    QtCore.QTimer.singleShot(120, self._flush_pota_spots)
+                return
+
+            # DXSpider: low rate, safe to update directly
+            self.dx_panel.add_spot(spot)
+        except Exception:
+            pass
+
+    @QtCore.Slot(str)
+    def _on_dx_error(self, msg: str):
+        try:
+            self.dx_panel.set_status(f"DX: offline ({msg})")
+        except Exception:
+            pass
+
+    @QtCore.Slot()
+    def _toggle_dx_panel(self):
+        self._dx_enabled = not bool(getattr(self, "_dx_enabled", False))
+        self._cfg["dx_enabled"] = bool(self._dx_enabled)
+        self._cfg["dx_source"] = str(getattr(self, "_dx_source", "dx"))
+        self._cfg["dx_host"] = self._dx_host
+        self._cfg["dx_port"] = int(self._dx_port)
+        save_config(CONFIG_PATH, self._cfg)
+
+        if self._dx_enabled:
+            self._layout_main_grid()
+            self.dx_panel.clear_spots()
+            self._start_dx_worker()
+        else:
+            self._stop_dx_worker()
+            self._layout_main_grid()
+
+        self._update_dx_button()
     def _update_fullscreen_button(self):
         if self._is_fullscreen():
             self.btn_fullscreen.setText("Exit full screen")
@@ -2592,7 +4081,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         try:
+            self._stop_dx_worker()
+        except Exception:
+            pass
+
+        try:
             self._worker.stop()
+
             self._thread.quit()
             self._thread.wait(2000)
         except Exception:
@@ -2933,6 +4428,14 @@ Note: this is an index, not a physical probability.""")
         )
 
         sfi_now = d.get("sfi_now", float("nan"))
+
+        # --- HF openings ribbon update (MUF + blackout + per-band chips) ---
+        try:
+            if hasattr(self, "hf_bar") and self.hf_bar is not None and getattr(self, "_hf_bar_visible", True) and self.hf_bar.isVisible():
+                self.hf_bar.update_from_indices(sfi_now, kp_now, flare_cls, sw_now)
+        except Exception:
+            pass
+
         sfi_accent = sfi_color(sfi_now)
         self.panels["SFI"].lbl_title.setText("SFI (F10.7 cm Flux) daily index")
         self._style_panel_title_default(self.panels["SFI"])
