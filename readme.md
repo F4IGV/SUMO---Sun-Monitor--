@@ -6,7 +6,7 @@
 
 ## 🇬🇧 English
 
-**SUMO (Solar Unified Monitoring Observatory)** is a real-time dashboard designed for **radio amateurs** who want to correlate **space weather conditions** with **on-air radio activity**.
+**SUMO is a real-time dashboard designed for **radio amateurs** who want to correlate **space weather conditions** with **on-air radio activity**.
 
 Originally focused on solar and geomagnetic monitoring, **SUMO v5.0** evolves into a **hybrid space weather and DX operations tool**, combining scientific data with live radio spotting sources in a single, operational interface.
 
@@ -88,7 +88,7 @@ These indicators are intended as **practical guidance tools**, not as VOACAP or 
 
 ## 🇫🇷 Français
 
-**SUMO (Solar Unified Monitoring Observatory)** est un tableau de bord temps réel destiné aux **radioamateurs** souhaitant mettre en relation **la météo spatiale** et **l’activité radio sur les bandes**.
+**SUMO est un tableau de bord temps réel destiné aux **radioamateurs** souhaitant mettre en relation **la météo spatiale** et **l’activité radio sur les bandes**.
 
 Initialement centré sur la surveillance solaire et géomagnétique, **SUMO v5.0** évolue vers un **outil hybride de veille spatiale et d’exploitation radio**, combinant données scientifiques et sources DX en direct dans une interface unique.
 
