@@ -7,11 +7,6 @@
 
 ---
 
-# 🌞 SUMO – Sun Monitor  
-### 📡 Real-time Solar, HF Propagation & ISS Tracking Dashboard
-
----
-
 ## 📖 Overview
 
 SUMO is a desktop application written in Python (PySide6) designed for radio amateurs.  
