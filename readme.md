@@ -86,15 +86,7 @@ Elle centralise en temps réel les données solaires, les conditions de propagat
 - Position utilisateur
 - Rotation automatique des vues
 
----
-
-### 🧱 Installation
-
-```bash
-pip install -r requirements.txt
-python main.py
-
-# 🌞 SUMO – Sun Monitor  
+  # 🌞 SUMO – Sun Monitor  
 ### 📡 Real-time Solar, HF Propagation & ISS Tracking Dashboard
 
 ---
@@ -221,10 +213,16 @@ It provides real-time solar data, HF propagation conditions, and ISS tracking in
 - Advanced logging system
 - Anti-crash safeguards
 
+
 ---
 
-## 🧱 Installation
+### 🧱 Installation
 
 ```bash
 pip install -r requirements.txt
 python main.py
+
+
+
+
+
