@@ -150,6 +150,10 @@ interpolation multi-passes
 lissage gaussien
 🌍 Horloges mondiales
 
+## Screenshot
+
+![SUMO v7_9_14 horloges](horloges.png)
+
 Affichage :
 
 horloge principale analogique
