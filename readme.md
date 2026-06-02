@@ -1,5 +1,5 @@
 
-![SUMO v7_9_14 Dashboard](DashBord.png)
+![SUMO v7_9_14 Dashboard](sumo.png)
 
 ☀️ SUMO – Sun Monitor
 
@@ -15,6 +15,8 @@ Fonctionnalités:
 
 
 📡 Surveillance de la météo spatiale
+
+![SUMO v7_9_14 Dashboard](DashBord.png)
 
 SUMO affiche en temps réel :
 
