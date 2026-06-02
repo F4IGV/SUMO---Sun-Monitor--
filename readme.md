@@ -38,6 +38,9 @@ déclencher des alertes sonores
 mettre en évidence les événements importants
 📟 Intégration DAPNET
 
+
+![SUMO v7_9_14 Dashboard](dapnet.png)
+
 Support complet du réseau DAPNET :
 
 envoi manuel de messages
@@ -51,6 +54,7 @@ identifiants DAPNET
 groupe d'émission
 seuils d'alerte
 indicateur « Emergency »
+
 🌦️ Vigilance Météo-France
 
 
