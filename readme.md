@@ -9,6 +9,9 @@ L'application centralise dans une interface unique les principales données four
 
 Fonctionnalités
 
+
+
+
 📡 Surveillance de la météo spatiale
 
 SUMO affiche en temps réel :
@@ -30,6 +33,10 @@ Champ magnétique interplanétaire Bz/Bt
 Prévisions aurorales NOAA
 
 Événements CME via NASA DONKI
+
+
+
+
 
 📈 Historique et visualisation
 
