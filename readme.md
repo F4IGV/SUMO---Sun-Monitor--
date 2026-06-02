@@ -43,6 +43,10 @@ d'une représentation des tendances
 
 d'une échelle temporelle basée sur les données NOAA
 
+
+
+
+
 🚨 Système d'alertes
 
 SUMO surveille automatiquement les changements d'état des différents indicateurs et peut :
@@ -52,6 +56,10 @@ modifier dynamiquement les couleurs des panneaux
 déclencher des alertes sonores
 
 mettre en évidence les événements importants
+
+
+
+
 
 📟 Intégration DAPNET
 
@@ -77,6 +85,10 @@ groupe d'émission
 seuils d'alerte
 
 indicateur « Emergency »
+
+
+
+
 
 🌦️ Vigilance Météo-France
 
@@ -105,6 +117,10 @@ vagues-submersion
 
 avec transmission automatique via DAPNET.
 
+
+
+
+
 🛰️ Suivi de l'ISS
 
 
@@ -120,6 +136,10 @@ géolocalisation de l'observateur
 
 calcul d'élévation et d'azimut
 
+
+
+
+
 🌍 Horloges mondiales
 
 
@@ -134,6 +154,9 @@ horloges secondaires configurables
 prise en charge des fuseaux horaires mondiaux
 
 
+
+
+
 📷 Tableau de bord SOHO
 
 
@@ -141,12 +164,22 @@ prise en charge des fuseaux horaires mondiaux
 
 Téléchargement automatique des images :
 
-SOHO EIT 171;
-SOHO EIT 195;
-SOHO EIT 284;
-SOHO LASCO C2;
-SOHO LASCO C3;
-HMI Continuum;
+SOHO EIT 171
+
+SOHO EIT 195
+
+SOHO EIT 284
+
+SOHO LASCO C2
+
+SOHO LASCO C3
+
+HMI Continuum
+
+
+
+
+
 
 🌎 Carte MUF expérimentale
 
@@ -156,45 +189,80 @@ HMI Continuum;
 Module d'estimation de la MUF utilisant :
 
 données ionosphériques
+
 interpolation IDW
+
 lissage multi-passes
+
 génération de cartes Europe et Monde
+
+
+
+
 📰 Flux d'informations
 
 Intégration :
 
 NASA Solar System News
+
 bulletin NOAA WWV
 
 avec affichage dans un bandeau défilant.
+
+
+
+
 
 🛡️ Robustesse
 
 SUMO intègre :
 
 journalisation avancée
+
 rotation automatique des logs
+
 gestion des exceptions non interceptées
+
 capture des crashs via faulthandler
+
 mécanismes anti-blocage
-Technologies utilisées
+
+Technologies utilisées:
+
 Python 3
+
 PySide6
+
 PyQtGraph
-NumPy
+
+Numpy
+
 Requests
+
 SQLite
+
 Skyfield
-Sources de données
+
+Sources de données:
+
 NOAA SWPC
+
 NASA DONKI
+
 NASA RSS
+
 SOHO
-Celestrak
+
+Celestar
+
 DAPNET
+
 Météo-France
+
+KG2C
+
 Auteur
 
-Yoann Daniel – F4IGV
+SUMO est une idée originale de F4IGV & F4FAP
 
 Développé pour fournir aux radioamateurs un outil moderne de surveillance solaire et de suivi des conditions de propagation HF.
