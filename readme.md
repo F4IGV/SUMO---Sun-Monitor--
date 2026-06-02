@@ -1,6 +1,6 @@
 ## Screenshot
 
-![SUMO v7_9_14 Dashboard](main/DashBord.png)
+![SUMO v7_9_14 Dashboard](DashBord.png)
 
 ☀️ SUMO – Sun Monitor
 
