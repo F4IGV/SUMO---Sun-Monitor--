@@ -131,6 +131,10 @@ géolocalisation de l'observateur
 prévisions automatiques
 🌎 Carte mondiale MUF
 
+## Screenshot
+
+![SUMO v7_9_14 muf](muf.png)
+
 Module expérimental inspiré de KC2G :
 
 Fonctionnalités :
