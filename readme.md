@@ -1,4 +1,3 @@
-## Screenshot
 
 ![SUMO v7_9_14 Dashboard](DashBord.png)
 
@@ -54,6 +53,9 @@ seuils d'alerte
 indicateur « Emergency »
 🌦️ Vigilance Météo-France
 
+
+![SUMO v7_9_14 Dashboard](vigilence.png)
+
 SUMO peut surveiller les vigilances :
 
 vent violent
@@ -70,7 +72,6 @@ avec transmission automatique via DAPNET.
 
 🛰️ Suivi de l'ISS
 
-## Screenshot
 
 ![SUMO v7_9_14 Dashboard](iss.png)
 
@@ -82,7 +83,6 @@ géolocalisation de l'observateur
 calcul d'élévation et d'azimut
 🌍 Horloges mondiales
 
-## Screenshot
 
 ![SUMO v7_9_14 Dashboard](horloges.png)
 
@@ -95,6 +95,9 @@ prise en charge des fuseaux horaires mondiaux
 
 📷 Tableau de bord SOHO
 
+
+![SUMO v7_9_14 Dashboard](soho.png)
+
 Téléchargement automatique des images :
 
 SOHO EIT 171
@@ -105,7 +108,6 @@ SOHO LASCO C3
 HMI Continuum
 🌎 Carte MUF expérimentale
 
-## Screenshot
 
 ![SUMO v7_9_14 Dashboard](muf.png)
 
