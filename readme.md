@@ -2,208 +2,267 @@
 
 ![SUMO v5.0 Dashboard](screenshots/SUMO_v5_0.png)
 
-# 🌞 SUMO – Sun Monitor  
-### 📡 Real-time Solar, HF Propagation & ISS Tracking Dashboard
+☀️ SUMO – Sun Monitor
 
----
+SUMO (Sun Monitor) est une application de surveillance de la météo spatiale destinée aux radioamateurs, passionnés d'ondes courtes, opérateurs HF, observateurs de l'activité solaire et utilisateurs du réseau DAPNET.
 
-## 📖 Overview
+Développé par Yoann Daniel (F4IGV), SUMO regroupe dans une seule interface moderne les principales données NOAA, NASA, DONKI, Météo-France, DAPNET et ISS afin d'offrir une vue en temps réel de l'environnement radioélectrique terrestre.
 
-SUMO is a desktop application written in Python (PySide6) designed for radio amateurs.  
-It provides real-time solar data, HF propagation conditions, and ISS tracking in a clean, readable, and operational interface.
+🚀 Fonctionnalités principales
+☀️ Surveillance solaire temps réel
 
----
+Affichage en temps réel des principaux indicateurs de météo spatiale :
 
-## 🚀 Main Features
+Kp Index
+Flux solaire SFI (10.7 cm)
+Sunspot Number (SSN)
+Flux X-Ray GOES
+Flux de protons GOES (>10 MeV)
+Vitesse du vent solaire
+Champ magnétique interplanétaire :
+Bz
+Bt
+Activité aurorale NOAA Ovation
+Prévision et suivi des CME via NASA DONKI
 
-### 🌞 Solar Data
-- Solar Flux **SFI (F10.7 cm)**
-- Sunspot Number **SSN**
-- Geomagnetic index **Kp**
-- Solar wind (speed, density)
-- Interplanetary magnetic field (**Bz / Bt**)
-- X-ray flux (A/B/C/M/X classification)
-- Proton flux (S0 → S5 scale)
-- Aurora activity (NOAA Ovation)
+Toutes les données sont récupérées directement depuis les services NOAA SWPC.
 
----
+📈 Graphiques historiques
 
-### 📡 HF Propagation
-- Global HF condition bar
-- **MUF map** (Maximum Usable Frequency)
-- HF openings detection
-- Radio blackout indicator
-- Visualization of usable bands
+Chaque indicateur dispose de son historique :
 
----
+Axe temporel réel NOAA
+Affichage des tendances
+Seuils d'alerte colorisés
+Conservation des historiques NOAA complets lorsque disponibles
+🎨 Système intelligent d'alertes visuelles
 
-### 🛰️ ISS Tracker
-- Real-time ISS position
-- Pass prediction:
-  - AOS (Acquisition of Signal)
-  - MAX (maximum elevation)
-  - LOS (Loss of Signal)
-- Maximum elevation display
-- Countdown to next pass
-- Based on user-defined location
+SUMO utilise une logique de sévérité uniforme :
 
----
+Risques de perturbations
+🟢 OK
+🟡 WATCH
+🟠 ALERT
+🔴 DANGER
+🟣 EXTREME
+Conditions HF
+🔴 POOR
+🟠 FAIR
+🟢 GOOD
+🔵 EXCELLENT
 
-### 📟 DAPNET Integration
-- Send POCSAG messages
-- **Emergency mode**
-- Alert modules:
-  - X-ray
-  - Proton
-  - ISS
-  - Solar weather
-- Quick-send interface integrated in UI
+Les changements d'état déclenchent automatiquement :
 
----
+changement de couleur
+clignotement des panneaux critiques
+alertes sonores
+📡 Intégration DAPNET
 
-### 🖼️ Solar Imaging
-- SOHO / SDO images:
-  - EIT (171 / 195 / 284)
-  - LASCO C2 / C3
-  - HMI continuum
-- Auto-refresh
-- Multi-threaded safe loading
+SUMO peut envoyer automatiquement des messages POCSAG via le réseau DAPNET.
 
----
+Modules disponibles :
 
-### 🌍 MUF Map
-- Global MUF visualization
-- Fixed scale (0–35 MHz)
-- Smoothed interpolation
-- Geographic overlays
+Alertes X-Ray
 
----
+Détection automatique :
 
-### 📰 RSS Feed
-- NASA Solar System News
-- Scrolling ticker
-- Adjustable speed and refresh
+M1+
+M5+
+X1+
+X10+
 
----
+Messages configurables :
 
-### 🕒 Clocks
-- Main analog clock (UTC or local)
-- Secondary clocks (multiple cities)
-- Optional hourly chime
+début d'événement
+fin d'événement
+mode urgence
+Alertes Protoniques
 
----
+Notifications :
 
-### 🎚️ Audio System
-- Global sound toggle
-- Volume control via sliders
-- Independent sound levels:
-  - Alerts
-  - Hourly chime
+S1 à S5
+dépassement de seuil configurable
+anti-spam intégré
+Vigilance Météo-France
 
----
+Envoi automatique des alertes :
 
-### ⚙️ Settings
-- NASA API key
-- DAPNET credentials
-- User geographic position
-- Display rotation settings
+Vent violent
+Orages
+Pluie-Inondation
+Crues
+Canicule
+Neige-Verglas
+Grand froid
+Avalanches
+Vagues-Submersion
 
----
+Paramètres :
 
-### 🔄 Dynamic Display System
-- 9 main solar panels
-- Multiple display modes:
-  - Solar dashboard
-  - Clocks
-  - MUF map
-  - SOHO imagery
-  - Solar system view
-- Automatic rotation
+départements sélectionnables
+seuils personnalisables
+urgence automatique en vigilance rouge
+Suivi ISS
 
----
+Notifications automatiques :
 
-### 🧠 Architecture & Stability
-- Multi-threaded (QThread)
-- Automatic retry (Skyfield / TLE)
-- Network throttling
-- Advanced logging system
-- Anti-crash safeguards
+Pré-alerte de passage
+Début de passage
+Point culminant
+Fin de passage
 
+Informations transmises :
 
-### 📖 Présentation
+élévation
+azimut
+heure du passage
+🛰️ Suivi de l'ISS
 
-SUMO est une application desktop développée en Python (PySide6) destinée aux radioamateurs.  
-Elle centralise en temps réel les données solaires, les conditions de propagation HF et le suivi de l’ISS dans une interface claire, lisible et opérationnelle.
+Utilisation de :
 
----
+Skyfield
+TLE Celestrak
 
-### 🚀 Fonctionnalités principales
+Fonctions :
 
-#### 🌞 Données solaires
-- Flux solaire **SFI (F10.7 cm)**
-- Nombre de taches solaires **SSN**
-- Indice géomagnétique **Kp**
-- Vent solaire (vitesse, densité)
-- Champ magnétique interplanétaire (**Bz / Bt**)
-- Flux X-ray (A/B/C/M/X)
-- Flux protons (échelle S0 → S5)
-- Activité aurorale
+calcul des passages
+suivi orbital
+géolocalisation de l'observateur
+prévisions automatiques
+🌎 Carte mondiale MUF
 
----
+Module expérimental inspiré de KC2G :
 
-#### 📡 Propagation HF
-- Barre HF globale (conditions radio)
-- Carte **MUF** (fréquence maximale utilisable)
-- Détection des ouvertures HF
-- Indicateur Radio Blackout
+Fonctionnalités :
 
----
+interpolation mondiale des données ionosphériques
+estimation MUF en temps réel
+carte Europe
+carte Monde
+lissage avancé
+système de confiance des données
 
-#### 🛰️ ISS Tracker
-- Position temps réel de l’ISS
-- Prédiction des passages :
-  - AOS / MAX / LOS
-  - Élévation maximale
-  - Compte à rebours
-- Basé sur la position utilisateur
+Algorithmes :
 
----
+IDW (Inverse Distance Weighting)
+post-traitement HF
+interpolation multi-passes
+lissage gaussien
+🌍 Horloges mondiales
 
-#### 📟 DAPNET
-- Envoi de messages POCSAG
-- Mode **Emergency**
-- Alertes :
-  - X-ray
-  - Proton
-  - ISS
-  - Météo solaire
+Affichage :
 
----
+horloge principale analogique
+jusqu'à 4 horloges mondiales
+fuseaux horaires configurables
 
-#### 🖼️ Imagerie solaire
-- SOHO / SDO :
-  - EIT (171 / 195 / 284)
-  - LASCO C2 / C3
-  - HMI continuum
+Exemples :
 
----
+Paris
+Londres
+New York
+Tokyo
+Sydney
+📷 Tableau de bord SOHO
 
-#### 📰 RSS dynamique
-- NASA Solar System News
-- Bandeau défilant configurable
+Affichage automatique :
 
----
+SOHO EIT 171
+SOHO EIT 195
+SOHO EIT 284
+LASCO C2
+LASCO C3
+HMI Continuum
 
-#### 🎚️ Audio
-- Activation/désactivation
-- Volume via sliders
-- Sons indépendants
+Images téléchargées directement depuis les serveurs NASA/ESA.
 
----
+🪐 Vue Système Solaire
 
-#### ⚙️ Configuration
-- API NASA
-- Paramètres DAPNET
-- Position utilisateur
-- Rotation automatique des vues
+Module graphique :
 
+représentation des planètes
+positions calculées avec Skyfield
+affichage de la Terre et de l'ISS
+données orbitales réelles
+📰 Flux RSS scientifiques
+
+Lecture automatique :
+
+NASA Solar System News
+Bulletins NOAA WWV
+
+Défilement intégré dans l'interface.
+
+🔊 Gestion avancée du son
+alertes indépendantes
+volume réglable
+carillon horaire configurable
+fichiers WAV personnalisables
+⚙️ Configuration
+
+Paramètres sauvegardés :
+
+API NASA
+DAPNET
+Météo-France
+Horloges
+Sons
+RSS
+Affichages alternés
+Position géographique
+🛡️ Système Anti-Crash
+
+SUMO intègre :
+
+journalisation avancée
+rotation automatique des logs
+capture des exceptions non interceptées
+dump des erreurs fatales
+surveillance des threads
+
+Fichiers générés :
+
+sumo_debug_anti_crash.log
+sumo_fault_anti_crash.log
+sumo_runtime_state.log
+🛠️ Technologies utilisées
+Python 3.13+
+PySide6
+PyQtGraph
+NumPy
+Requests
+SQLite
+Skyfield
+📡 Sources de données
+NOAA SWPC
+NASA DONKI
+NASA RSS
+ESA / SOHO
+Celestrak
+DAPNET
+Météo-France
+GIRO
+KC2G
+👨‍💻 Auteur
+
+Sumo est une idée originale de Yoann Daniel – F4IGV & Eric - F4FAP
+
+Passionnés de radioamateurisme, météo spatiale, propagation HF et développement logiciel.
+
+Projet développé pour fournir aux radioamateurs un outil moderne de surveillance solaire et géomagnétique permettant d'anticiper les conditions de propagation et les événements susceptibles d'impacter les communications radio.
+
+📜 Licence
+
+Ce projet est distribué sous licence :
+
+GNU General Public License v3.0 (GPL-3.0)
+
+Vous êtes libre de :
+
+utiliser
+modifier
+redistribuer
+
+à condition de conserver la même licence et les mentions de copyright.
+
+⭐ Si SUMO vous est utile, n'hésitez pas à mettre une étoile sur le projet GitHub et à contribuer à son développement.
