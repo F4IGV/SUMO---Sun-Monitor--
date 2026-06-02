@@ -7,6 +7,8 @@ SUMO (Sun Monitor) est une application de surveillance de la météo spatiale d�
 
 L'application centralise dans une interface unique les principales données fournies par NOAA, NASA, SOHO, Celestrak et DAPNET afin d'offrir une vision en temps réel de l'environnement radioélectrique terrestre.
 
+Elle propose une connexion aux cluster radioamateur telnet et Pota
+
 Fonctionnalités:
 
 
