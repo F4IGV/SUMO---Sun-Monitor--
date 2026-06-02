@@ -65,13 +65,21 @@ indicateur « Emergency »
 SUMO peut surveiller les vigilances :
 
 vent violent
+
 orages
+
 pluie-inondation
+
 crues
+
 canicule
+
 neige-verglas
+
 grand froid
+
 avalanches
+
 vagues-submersion
 
 avec transmission automatique via DAPNET.
