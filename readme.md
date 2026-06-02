@@ -14,13 +14,21 @@ Fonctionnalités
 SUMO affiche en temps réel :
 
 Indice planétaire Kp
+
 Flux solaire SFI (F10.7)
+
 Nombre de taches solaires (SSN)
+
 Flux X-Ray GOES
+
 Flux protonique GOES (>10 MeV)
+
 Vitesse du vent solaire
+
 Champ magnétique interplanétaire Bz/Bt
+
 Prévisions aurorales NOAA
+
 Événements CME via NASA DONKI
 
 📈 Historique et visualisation
@@ -28,16 +36,23 @@ Prévisions aurorales NOAA
 Chaque indicateur dispose :
 
 d'un graphique historique
+
 d'un système de couleurs cohérent
+
 d'une représentation des tendances
+
 d'une échelle temporelle basée sur les données NOAA
+
 🚨 Système d'alertes
 
 SUMO surveille automatiquement les changements d'état des différents indicateurs et peut :
 
 modifier dynamiquement les couleurs des panneaux
+
 déclencher des alertes sonores
+
 mettre en évidence les événements importants
+
 📟 Intégration DAPNET
 
 
@@ -46,15 +61,21 @@ mettre en évidence les événements importants
 Support complet du réseau DAPNET :
 
 envoi manuel de messages
+
 alertes météo spatiale
+
 alertes Météo-France
+
 notifications de passages ISS
 
 Configuration :
 
 identifiants DAPNET
+
 groupe d'émission
+
 seuils d'alerte
+
 indicateur « Emergency »
 
 🌦️ Vigilance Météo-France
@@ -92,8 +113,11 @@ avec transmission automatique via DAPNET.
 Calcul des passages ISS à partir des TLE Celestrak :
 
 prévisions de passage
+
 notifications automatiques
+
 géolocalisation de l'observateur
+
 calcul d'élévation et d'azimut
 
 🌍 Horloges mondiales
@@ -104,7 +128,9 @@ calcul d'élévation et d'azimut
 Tableau de bord multi-fuseaux horaires comprenant :
 
 horloge principale
+
 horloges secondaires configurables
+
 prise en charge des fuseaux horaires mondiaux
 
 
@@ -115,12 +141,12 @@ prise en charge des fuseaux horaires mondiaux
 
 Téléchargement automatique des images :
 
-SOHO EIT 171
-SOHO EIT 195
-SOHO EIT 284
-SOHO LASCO C2
-SOHO LASCO C3
-HMI Continuum
+SOHO EIT 171;
+SOHO EIT 195;
+SOHO EIT 284;
+SOHO LASCO C2;
+SOHO LASCO C3;
+HMI Continuum;
 
 🌎 Carte MUF expérimentale
 
